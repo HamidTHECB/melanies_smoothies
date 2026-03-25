@@ -66,12 +66,6 @@ div[data-testid="stDataFrame"] {
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-def quote_ident(name: str) -> str:
-    """Safely quote Snowflake identifiers."""
-    if name is None:
-        return '""'
-    return '"' + str(name).replace('"', '""') + '"'
-
 def format_bytes(num_bytes):
     if pd.isna(num_bytes):
         return None
@@ -93,6 +87,12 @@ def metric_card(label, value, subtitle=""):
         """,
         unsafe_allow_html=True
     )
+
+def ensure_columns(df: pd.DataFrame, required_cols: list[str]) -> pd.DataFrame:
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = None
+    return df[required_cols]
 
 # -----------------------------------------------------------------------------
 # Data loading functions
@@ -142,26 +142,24 @@ def load_table_view_metadata():
 
     return df
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_databases():
-    df = session.sql("SHOW DATABASES").to_pandas()
-    if df.empty:
-        return df
-    df.columns = [c.upper() for c in df.columns]
-    return df
-
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_procedures():
-    dbs = load_databases()
-    if dbs.empty or "NAME" not in dbs.columns:
-        return pd.DataFrame()
+    required_cols = [
+        "PROCEDURE_CATALOG",
+        "PROCEDURE_SCHEMA",
+        "PROCEDURE_NAME",
+        "PROCEDURE_OWNER",
+        "CREATED",
+        "LAST_ALTERED",
+        "PROCEDURE_LANGUAGE",
+        "ARGUMENT_SIGNATURE",
+        "RETURNS",
+        "COMMENT"
+    ]
 
-    frames = []
-
-    for db_name in dbs["NAME"].dropna().tolist():
-        safe_db = quote_ident(db_name)
-
-        query = f"""
+    # Try ACCOUNT_USAGE first
+    try:
+        query = """
         SELECT
             PROCEDURE_CATALOG,
             PROCEDURE_SCHEMA,
@@ -171,39 +169,68 @@ def load_procedures():
             LAST_ALTERED,
             PROCEDURE_LANGUAGE,
             ARGUMENT_SIGNATURE,
-            DATA_TYPE AS RETURNS
-        FROM {safe_db}.INFORMATION_SCHEMA.PROCEDURES
+            DATA_TYPE AS RETURNS,
+            COMMENT
+        FROM SNOWFLAKE.ACCOUNT_USAGE.PROCEDURES
+        WHERE DELETED IS NULL
         """
+        df = session.sql(query).to_pandas()
+        if not df.empty:
+            df.columns = [c.upper() for c in df.columns]
+            df["CREATED"] = pd.to_datetime(df["CREATED"], errors="coerce")
+            df["LAST_ALTERED"] = pd.to_datetime(df["LAST_ALTERED"], errors="coerce")
+            return ensure_columns(df, required_cols)
+    except Exception:
+        pass
 
-        try:
-            part = session.sql(query).to_pandas()
-            if not part.empty:
-                part.columns = [c.upper() for c in part.columns]
-                frames.append(part)
-        except Exception:
-            continue
+    # Fallback to SHOW USER PROCEDURES IN ACCOUNT
+    try:
+        df = session.sql("SHOW USER PROCEDURES IN ACCOUNT").to_pandas()
+        if df.empty:
+            return pd.DataFrame(columns=required_cols)
 
-    if not frames:
-        return pd.DataFrame()
+        df.columns = [c.upper() for c in df.columns]
 
-    df = pd.concat(frames, ignore_index=True)
-    df["CREATED"] = pd.to_datetime(df["CREATED"], errors="coerce")
-    df["LAST_ALTERED"] = pd.to_datetime(df["LAST_ALTERED"], errors="coerce")
+        rename_map = {
+            "CATALOG_NAME": "PROCEDURE_CATALOG",
+            "SCHEMA_NAME": "PROCEDURE_SCHEMA",
+            "NAME": "PROCEDURE_NAME",
+            "OWNER": "PROCEDURE_OWNER",
+            "DESCRIPTION": "COMMENT",
+            "LANGUAGE": "PROCEDURE_LANGUAGE",
+            "RETURN_TYPE": "RETURNS",
+            "ARGUMENTS": "ARGUMENT_SIGNATURE"
+        }
+        df = df.rename(columns=rename_map)
 
-    return df
+        if "CREATED_ON" in df.columns:
+            df["CREATED"] = pd.to_datetime(df["CREATED_ON"], errors="coerce")
+        else:
+            df["CREATED"] = pd.NaT
 
-@st.cache_data(ttl=3600, show_spinner=False)
+        df["LAST_ALTERED"] = pd.NaT
+        return ensure_columns(df, required_cols)
+    except Exception:
+        return pd.DataFrame(columns=required_cols)
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_functions():
-    dbs = load_databases()
-    if dbs.empty or "NAME" not in dbs.columns:
-        return pd.DataFrame()
+    required_cols = [
+        "FUNCTION_CATALOG",
+        "FUNCTION_SCHEMA",
+        "FUNCTION_NAME",
+        "FUNCTION_OWNER",
+        "CREATED",
+        "LAST_ALTERED",
+        "FUNCTION_LANGUAGE",
+        "ARGUMENT_SIGNATURE",
+        "RETURNS",
+        "COMMENT"
+    ]
 
-    frames = []
-
-    for db_name in dbs["NAME"].dropna().tolist():
-        safe_db = quote_ident(db_name)
-
-        query = f"""
+    # Try ACCOUNT_USAGE first
+    try:
+        query = """
         SELECT
             FUNCTION_CATALOG,
             FUNCTION_SCHEMA,
@@ -211,27 +238,51 @@ def load_functions():
             FUNCTION_OWNER,
             CREATED,
             LAST_ALTERED,
+            FUNCTION_LANGUAGE,
+            ARGUMENT_SIGNATURE,
             DATA_TYPE AS RETURNS,
-            ARGUMENT_SIGNATURE
-        FROM {safe_db}.INFORMATION_SCHEMA.FUNCTIONS
+            COMMENT
+        FROM SNOWFLAKE.ACCOUNT_USAGE.FUNCTIONS
+        WHERE DELETED IS NULL
         """
+        df = session.sql(query).to_pandas()
+        if not df.empty:
+            df.columns = [c.upper() for c in df.columns]
+            df["CREATED"] = pd.to_datetime(df["CREATED"], errors="coerce")
+            df["LAST_ALTERED"] = pd.to_datetime(df["LAST_ALTERED"], errors="coerce")
+            return ensure_columns(df, required_cols)
+    except Exception:
+        pass
 
-        try:
-            part = session.sql(query).to_pandas()
-            if not part.empty:
-                part.columns = [c.upper() for c in part.columns]
-                frames.append(part)
-        except Exception:
-            continue
+    # Fallback to SHOW USER FUNCTIONS IN ACCOUNT
+    try:
+        df = session.sql("SHOW USER FUNCTIONS IN ACCOUNT").to_pandas()
+        if df.empty:
+            return pd.DataFrame(columns=required_cols)
 
-    if not frames:
-        return pd.DataFrame()
+        df.columns = [c.upper() for c in df.columns]
 
-    df = pd.concat(frames, ignore_index=True)
-    df["CREATED"] = pd.to_datetime(df["CREATED"], errors="coerce")
-    df["LAST_ALTERED"] = pd.to_datetime(df["LAST_ALTERED"], errors="coerce")
+        rename_map = {
+            "CATALOG_NAME": "FUNCTION_CATALOG",
+            "SCHEMA_NAME": "FUNCTION_SCHEMA",
+            "NAME": "FUNCTION_NAME",
+            "OWNER": "FUNCTION_OWNER",
+            "DESCRIPTION": "COMMENT",
+            "LANGUAGE": "FUNCTION_LANGUAGE",
+            "RETURN_TYPE": "RETURNS",
+            "ARGUMENTS": "ARGUMENT_SIGNATURE"
+        }
+        df = df.rename(columns=rename_map)
 
-    return df
+        if "CREATED_ON" in df.columns:
+            df["CREATED"] = pd.to_datetime(df["CREATED_ON"], errors="coerce")
+        else:
+            df["CREATED"] = pd.NaT
+
+        df["LAST_ALTERED"] = pd.NaT
+        return ensure_columns(df, required_cols)
+    except Exception:
+        return pd.DataFrame(columns=required_cols)
 
 # -----------------------------------------------------------------------------
 # Load metadata
@@ -264,25 +315,23 @@ if "All" in selected_dbs or not selected_dbs:
 filtered_df = obj_df[obj_df["TABLE_CATALOG"].isin(selected_dbs)].copy()
 
 search_text = st.sidebar.text_input("Search tables/views")
-
 if search_text:
     filtered_df = filtered_df[
         filtered_df["TABLE_NAME"].str.contains(search_text, case=False, na=False)
     ].copy()
 
-# Filter procedures
 filtered_proc_df = proc_df.copy()
 if not filtered_proc_df.empty:
     filtered_proc_df = filtered_proc_df[
         filtered_proc_df["PROCEDURE_CATALOG"].isin(selected_dbs)
     ].copy()
 
-# Filter functions
 filtered_func_df = func_df.copy()
 if not filtered_func_df.empty:
     filtered_func_df = filtered_func_df[
         filtered_func_df["FUNCTION_CATALOG"].isin(selected_dbs)
     ].copy()
+
 # -----------------------------------------------------------------------------
 # KPI card metrics
 # -----------------------------------------------------------------------------
@@ -323,6 +372,16 @@ with a1:
     st.info(f"**Total Rows:** {total_rows:,}")
 with a2:
     st.info(f"**Total Data Size:** {format_bytes(total_bytes)}")
+
+# -----------------------------------------------------------------------------
+# Debug panel
+# -----------------------------------------------------------------------------
+with st.expander("Debug counts"):
+    st.write("Loaded tables/views rows:", len(obj_df))
+    st.write("Loaded procedures rows:", len(proc_df))
+    st.write("Loaded functions rows:", len(func_df))
+    st.write("Filtered procedures rows:", len(filtered_proc_df))
+    st.write("Filtered functions rows:", len(filtered_func_df))
 
 # -----------------------------------------------------------------------------
 # Tabs
@@ -428,7 +487,7 @@ with tab2:
     )
 
 # -----------------------------------------------------------------------------
-# Tab 3 - Schema Summary
+# Tab 3 - Schemas
 # -----------------------------------------------------------------------------
 with tab3:
     st.subheader("Schema Summary")
@@ -514,7 +573,7 @@ with tab4:
         proc_display = filtered_proc_df.copy()
         if proc_search:
             proc_display = proc_display[
-                proc_display["PROCEDURE_NAME"].str.contains(proc_search, case=False, na=False)
+                proc_display["PROCEDURE_NAME"].astype(str).str.contains(proc_search, case=False, na=False)
             ].copy()
 
         st.dataframe(
@@ -527,7 +586,8 @@ with tab4:
                 "PROCEDURE_LANGUAGE",
                 "PROCEDURE_OWNER",
                 "CREATED",
-                "LAST_ALTERED"
+                "LAST_ALTERED",
+                "COMMENT"
             ]].rename(columns={
                 "PROCEDURE_CATALOG": "DATABASE",
                 "PROCEDURE_SCHEMA": "SCHEMA",
@@ -553,7 +613,7 @@ with tab5:
         func_display = filtered_func_df.copy()
         if func_search:
             func_display = func_display[
-                func_display["FUNCTION_NAME"].str.contains(func_search, case=False, na=False)
+                func_display["FUNCTION_NAME"].astype(str).str.contains(func_search, case=False, na=False)
             ].copy()
 
         st.dataframe(
@@ -563,13 +623,16 @@ with tab5:
                 "FUNCTION_NAME",
                 "ARGUMENT_SIGNATURE",
                 "RETURNS",
+                "FUNCTION_LANGUAGE",
                 "FUNCTION_OWNER",
                 "CREATED",
-                "LAST_ALTERED"
+                "LAST_ALTERED",
+                "COMMENT"
             ]].rename(columns={
                 "FUNCTION_CATALOG": "DATABASE",
                 "FUNCTION_SCHEMA": "SCHEMA",
                 "FUNCTION_NAME": "FUNCTION",
+                "FUNCTION_LANGUAGE": "LANGUAGE",
                 "FUNCTION_OWNER": "OWNER"
             }).sort_values(["DATABASE", "SCHEMA", "FUNCTION"]),
             use_container_width=True,
@@ -581,6 +644,6 @@ with tab5:
 # -----------------------------------------------------------------------------
 st.markdown("---")
 st.caption(
-    "Notes: Tables and views are sourced from SNOWFLAKE.ACCOUNT_USAGE. "
-    "Procedures and functions are sourced from each database INFORMATION_SCHEMA."
+    "Tables and views come from SNOWFLAKE.ACCOUNT_USAGE.TABLES/COLUMNS. "
+    "Procedures and functions try ACCOUNT_USAGE first, then fall back to SHOW USER ... IN ACCOUNT."
 )
